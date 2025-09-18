@@ -313,7 +313,7 @@ function HeaderHillsIllustration() {
 const STORAGE_KEYS = {
   TASKS: 'tasknest_tasks_v1',
   THEME: 'tasknest_theme_v1',
-  STATS: 'tasknest_focus_stats_v1',
+  STATS: 'tasknest_focus_stats_v2',
   TIMER: 'tasknest_timer_state_v1'
 };
 
@@ -349,11 +349,20 @@ function loadStoredTheme() {
 
 function loadStoredStats() {
   try {
+    // Clear any obsolete v1 test data
+    localStorage.removeItem('tasknest_focus_stats_v1');
     const raw = localStorage.getItem(STORAGE_KEYS.STATS);
-    if (!raw) return { sessionsCompleted: 3, totalMinutes: 75, recentHistory: [25, 25, 25] };
-    return JSON.parse(raw);
+    if (!raw) {
+      return { sessionsCompleted: 0, totalMinutes: 0, recentHistory: [] };
+    }
+    const parsed = JSON.parse(raw);
+    return {
+      sessionsCompleted: typeof parsed.sessionsCompleted === 'number' ? Math.max(0, parsed.sessionsCompleted) : 0,
+      totalMinutes: typeof parsed.totalMinutes === 'number' ? Math.max(0, parsed.totalMinutes) : 0,
+      recentHistory: Array.isArray(parsed.recentHistory) ? parsed.recentHistory : []
+    };
   } catch (e) {
-    return { sessionsCompleted: 3, totalMinutes: 75, recentHistory: [25, 25, 25] };
+    return { sessionsCompleted: 0, totalMinutes: 0, recentHistory: [] };
   }
 }
 
@@ -1095,6 +1104,21 @@ function FocusPage({ focusStats, onSessionComplete }) {
 
   // High precision target timestamp ref
   const targetEndTimeRef = useRef(null);
+  // Guard ref to ensure each completed session is counted exactly ONCE
+  const hasCompletedSessionRef = useRef(false);
+
+  // Exact single-fire completion trigger
+  const triggerCompletion = useCallback(() => {
+    if (hasCompletedSessionRef.current) return;
+    hasCompletedSessionRef.current = true;
+    setIsRunning(false);
+    targetEndTimeRef.current = null;
+    setRemainingSeconds(0);
+    setShowCompletionModal(true);
+    // Calculate actual session duration in minutes (custom or presets)
+    const sessionMins = Math.max(1, Math.round(duration / 60));
+    onSessionComplete(sessionMins);
+  }, [duration, onSessionComplete]);
 
   // Timer Tick & Real-time sync with Date.now() to guarantee background accuracy
   useEffect(() => {
@@ -1107,6 +1131,7 @@ function FocusPage({ focusStats, onSessionComplete }) {
       }
 
       interval = setInterval(() => {
+        if (!targetEndTimeRef.current) return;
         const now = Date.now();
         const diffMs = targetEndTimeRef.current - now;
         const nextSec = Math.max(0, Math.ceil(diffMs / 1000));
@@ -1115,19 +1140,17 @@ function FocusPage({ focusStats, onSessionComplete }) {
 
         if (nextSec <= 0) {
           clearInterval(interval);
-          setIsRunning(false);
-          targetEndTimeRef.current = null;
-          setShowCompletionModal(true);
-          const sessionMins = Math.round(duration / 60);
-          onSessionComplete(sessionMins);
+          triggerCompletion();
         }
       }, 250); // fast polling for ultra-smooth UI updates
     } else {
       targetEndTimeRef.current = null;
     }
 
-    return () => clearInterval(interval);
-  }, [isRunning, remainingSeconds, duration, onSessionComplete]);
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, [isRunning, triggerCompletion]);
 
   // Resync immediately when tab becomes visible after being backgrounded
   useEffect(() => {
@@ -1139,22 +1162,19 @@ function FocusPage({ focusStats, onSessionComplete }) {
         setRemainingSeconds(nextSec);
 
         if (nextSec <= 0) {
-          setIsRunning(false);
-          targetEndTimeRef.current = null;
-          setShowCompletionModal(true);
-          const sessionMins = Math.round(duration / 60);
-          onSessionComplete(sessionMins);
+          triggerCompletion();
         }
       }
     };
 
     document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
-  }, [isRunning, duration, onSessionComplete]);
+  }, [isRunning, triggerCompletion]);
 
   // Timer Controls
   const handleStart = () => {
     playSoftTick();
+    hasCompletedSessionRef.current = false;
     targetEndTimeRef.current = Date.now() + remainingSeconds * 1000;
     setIsRunning(true);
   };
@@ -1167,12 +1187,14 @@ function FocusPage({ focusStats, onSessionComplete }) {
 
   const handleResume = () => {
     playSoftTick();
+    hasCompletedSessionRef.current = false;
     targetEndTimeRef.current = Date.now() + remainingSeconds * 1000;
     setIsRunning(true);
   };
 
   const handleReset = () => {
     playSoftTick();
+    hasCompletedSessionRef.current = false;
     setIsRunning(false);
     targetEndTimeRef.current = null;
     setRemainingSeconds(duration);
@@ -1180,6 +1202,7 @@ function FocusPage({ focusStats, onSessionComplete }) {
 
   const handleSelectPreset = (minutes, label) => {
     playSoftTick();
+    hasCompletedSessionRef.current = false;
     setIsRunning(false);
     targetEndTimeRef.current = null;
     const secs = minutes * 60;
@@ -1191,6 +1214,7 @@ function FocusPage({ focusStats, onSessionComplete }) {
   const handleApplyCustom = (mins, secs) => {
     const totalSecs = mins * 60 + secs;
     if (totalSecs <= 0) return;
+    hasCompletedSessionRef.current = false;
     setIsRunning(false);
     targetEndTimeRef.current = null;
     setDuration(totalSecs);
@@ -1216,16 +1240,16 @@ function FocusPage({ focusStats, onSessionComplete }) {
   // Elapsed Progress calculation (0% to 100%)
   const progressPercent = duration > 0 ? ((duration - remainingSeconds) / duration) * 100 : 0;
 
-  // Format Total Focus Time (e.g. 1h 15m)
+  // Format Total Focus Time (e.g. 0m, 25m, 50m, 1h 40m)
   const formattedTotalTime = useMemo(() => {
-    const totalMins = focusStats.totalMinutes || 0;
+    const totalMins = (focusStats && typeof focusStats.totalMinutes === 'number') ? focusStats.totalMinutes : 0;
     const h = Math.floor(totalMins / 60);
     const m = totalMins % 60;
     if (h > 0) {
-      return `${h}h ${m}m`;
+      return m > 0 ? `${h}h ${m}m` : `${h}h`;
     }
     return `${m}m`;
-  }, [focusStats.totalMinutes]);
+  }, [focusStats]);
 
   return (
     <div className="focus-page-layout">
